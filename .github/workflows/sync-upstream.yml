@@ -1,0 +1,1105 @@
+# ============================================================
+# Fork 仓库自动同步上游 & 仓库保活
+# ============================================================
+#
+# 【用途】
+#   自动将上游仓库（fork 来源）的代码和 Release 同步到当前 fork
+#   同时定期创建空提交防止 GitHub 因 60 天不活跃暂停 Actions
+#
+# 【使用方法】
+#   1. 将本文件放到 fork 仓库的 .github/workflows/ 目录下
+#   2. 提交并推送到默认分支（main/master）
+#   3. 无需任何额外配置，自动检测 fork 来源
+#
+# 【手动触发】
+#   仓库 → Actions → Sync Upstream & Keep Alive → Run workflow
+#   可选择：同步模式、只同步最新版、跳过代码/Release同步等
+#
+# 【自动触发】
+#   每 5 天凌晨 3 点自动执行一次
+#
+# 【注意事项】
+#   - 无需设置 secrets 或 PAT，使用 GitHub 内置 token
+#   - 需开启仓库写权限（一次性设置）：
+#       仓库 → Settings → Actions → General → Workflow permissions
+#       → 选择 "Read and write permissions" → Save
+#   - 上游 workflow 文件会自动删除，只保留本文件
+#   - 同步代码时自动保留本地 workflows（不会被上游覆盖）
+#   - 如遇失败，重跑一次即可自动恢复（幂等设计）
+#   - 如需指定上游仓库，修改下方 UPSTREAM_REPO（留空则自动检测）
+#
+# ============================================================
+
+name: Sync Upstream & Keep Alive
+
+# ============================================================
+# 默认参数配置（定时自动执行时使用这些值，手动执行时可在界面上覆盖）
+# ============================================================
+env:
+  # 上游仓库地址，留空则自动检测 fork 来源
+  UPSTREAM_REPO: ""
+  # 同步模式：force=强制（删除并重建），incremental=增量（保留已有）
+  SYNC_MODE: "force"
+  # 只同步最新版本：true=只同步最新并自动清理旧版本，false=同步全部版本
+  SYNC_LATEST_ONLY: "true"
+  # 跳过代码同步：true=只同步 Release 不同步代码，false=同步代码
+  SKIP_CODE_SYNC: "false"
+  # 跳过 Release 同步：true=只同步代码不同步 Release，false=同步 Release
+  SKIP_RELEASE_SYNC: "false"
+  # 删除上游工作流：true=删除上游 workflow 文件和历史记录，false=保留
+  DISABLE_UPSTREAM_ACTIONS: "true"
+
+# ============================================================
+# 触发器配置
+# ============================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      sync_mode_override:
+        description: '🔁 同步模式（选下拉框）'
+        required: false
+        default: 'force - 强制删除后重建'
+        type: choice
+        options:
+          - 'force - 强制删除后重建'
+          - 'incremental - 增量保留已有'
+      sync_latest_only:
+        description: '📌 只同步最新版本（同时清理旧版）'
+        required: false
+        default: true
+        type: boolean
+      skip_code_sync:
+        description: '⏭️ 跳过代码同步（仅同步 Release）'
+        required: false
+        default: false
+        type: boolean
+      skip_release_sync:
+        description: '⏭️ 跳过 Release 同步（仅同步代码）'
+        required: false
+        default: false
+        type: boolean
+      disable_upstream_actions:
+        description: '🚫 删除上游工作流文件和历史记录'
+        required: false
+        default: true
+        type: boolean
+
+  schedule:
+    - cron: "0 3 */5 * *"
+
+# ============================================================
+# 任务配置
+# ============================================================
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    permissions:
+      contents: write
+      actions: write
+    
+    concurrency:
+      group: sync-upstream
+      cancel-in-progress: false
+
+    steps:
+      # ============================================
+      # 步骤1: 检出复刻仓库
+      # ============================================
+      - name: 📥 检出复刻仓库
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+          persist-credentials: true
+
+      # ============================================
+      # 步骤2: 自动检测上游仓库
+      # ============================================
+      - name: 🔍 自动检测上游仓库
+        id: detect_upstream
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          echo "=========================================="
+          echo "🔍 自动检测上游仓库"
+          echo "=========================================="
+          
+          MANUAL_UPSTREAM="${{ env.UPSTREAM_REPO }}"
+          
+          if [ -n "$MANUAL_UPSTREAM" ]; then
+            echo "📌 使用手动配置: $MANUAL_UPSTREAM"
+            echo "upstream_repo=$MANUAL_UPSTREAM" >> $GITHUB_OUTPUT
+            echo "detected=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          CURRENT_REPO="${{ github.repository }}"
+          echo "当前仓库: $CURRENT_REPO"
+          
+          REPO_INFO=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$CURRENT_REPO")
+          
+          IS_FORK=$(echo "$REPO_INFO" | jq -r '.fork')
+          
+          if [ "$IS_FORK" != "true" ]; then
+            echo "⚠️ 当前仓库不是复刻仓库"
+            echo "请手动设置 UPSTREAM_REPO"
+            exit 1
+          fi
+          
+          PARENT_REPO=$(echo "$REPO_INFO" | jq -r '.parent.full_name')
+          
+          if [ -z "$PARENT_REPO" ] || [ "$PARENT_REPO" == "null" ]; then
+            echo "❌ 无法获取父仓库信息"
+            exit 1
+          fi
+          
+          echo "✅ 自动检测到上游仓库: $PARENT_REPO"
+          echo "upstream_repo=$PARENT_REPO" >> $GITHUB_OUTPUT
+          echo "detected=true" >> $GITHUB_OUTPUT
+
+      # ============================================
+      # 步骤3: 显示配置信息
+      # ============================================
+      - name: 📋 显示配置信息
+        run: |
+          UPSTREAM="${{ steps.detect_upstream.outputs.upstream_repo }}"
+
+          echo "=========================================="
+          echo "📋 同步配置信息"
+          echo "=========================================="
+          echo "当前仓库: ${{ github.repository }}"
+          echo "上游仓库: ${UPSTREAM:-未检测到}"
+          echo "触发方式: ${{ github.event_name }}"
+          echo "------------------------------------------"
+          echo "同步模式: ${{ github.event.inputs.sync_mode_override || env.SYNC_MODE }}"
+          echo "只同步最新版本: ${{ github.event.inputs.sync_latest_only || env.SYNC_LATEST_ONLY }}（true=只同步最新并清理旧版，false=同步全部）"
+          echo "跳过代码同步: ${{ github.event.inputs.skip_code_sync || env.SKIP_CODE_SYNC }}"
+          echo "跳过Release同步: ${{ github.event.inputs.skip_release_sync || env.SKIP_RELEASE_SYNC }}"
+          echo "删除上游工作流: ${{ github.event.inputs.disable_upstream_actions || env.DISABLE_UPSTREAM_ACTIONS }}"
+          echo "=========================================="
+
+          if [ -z "$UPSTREAM" ]; then
+            echo "❌ 未检测到上游仓库"
+            exit 1
+          fi
+
+      # ============================================
+      # 步骤4: 配置 Git（不设置 extraheader）
+      # ============================================
+      - name: ⚙️ 配置 Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "✅ Git 配置完成"
+
+      # ============================================
+      # 步骤5: 添加上游仓库
+      # ============================================
+      - name: 🔗 添加上游仓库
+        run: |
+          UPSTREAM_REPO="${{ steps.detect_upstream.outputs.upstream_repo }}"
+          UPSTREAM_URL="https://${{ github.token }}@github.com/${UPSTREAM_REPO}.git"
+          
+          echo "上游仓库: $UPSTREAM_REPO"
+          git remote add upstream $UPSTREAM_URL || git remote set-url upstream $UPSTREAM_URL
+          
+          # 获取上游所有信息（包括分支和标签）
+          git fetch upstream --tags --prune --force
+          
+          echo "✅ 上游仓库添加成功"
+          echo ""
+          echo "📌 上游分支:"
+          git branch -r | grep upstream | head -3 || echo "   (无)"
+          echo ""
+          echo "📌 上游 Tags:"
+          git ls-remote --tags upstream | grep -v '\^{}' | tail -5 || echo "   (无)"
+
+      # ============================================
+      # 步骤6: 获取上游默认分支的 commit SHA
+      # ============================================
+      - name: 🔍 获取上游 commit SHA
+        id: get_sha
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          UPSTREAM_REPO="${{ steps.detect_upstream.outputs.upstream_repo }}"
+
+          echo "=========================================="
+          echo "🔍 获取上游 commit SHA"
+          echo "=========================================="
+
+          # 通过 API 获取上游仓库的默认分支
+          REPO_HTTP=$(curl -s -o /tmp/repo_info.json -w "%{http_code}" \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$UPSTREAM_REPO")
+
+          echo "📡 仓库信息 API HTTP: $REPO_HTTP"
+          if [ "$REPO_HTTP" != "200" ]; then
+            echo "❌ 获取仓库信息失败"
+            cat /tmp/repo_info.json | head -c 300
+            echo ""
+            exit 1
+          fi
+
+          DEFAULT_BRANCH=$(cat /tmp/repo_info.json | jq -r '.default_branch')
+          if [ "$DEFAULT_BRANCH" == "null" ] || [ -z "$DEFAULT_BRANCH" ]; then
+            echo "❌ 无法获取默认分支"
+            exit 1
+          fi
+          echo "默认分支: $DEFAULT_BRANCH"
+
+          # 获取默认分支的最新 commit SHA
+          BRANCH_HTTP=$(curl -s -o /tmp/branch_info.json -w "%{http_code}" \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$UPSTREAM_REPO/branches/$DEFAULT_BRANCH")
+
+          echo "📡 分支信息 API HTTP: $BRANCH_HTTP"
+          if [ "$BRANCH_HTTP" != "200" ]; then
+            echo "❌ 获取分支信息失败"
+            cat /tmp/branch_info.json | head -c 300
+            echo ""
+            exit 1
+          fi
+
+          COMMIT_SHA=$(cat /tmp/branch_info.json | jq -r '.commit.sha')
+          if [ "$COMMIT_SHA" == "null" ] || [ -z "$COMMIT_SHA" ]; then
+            echo "❌ 无法获取 commit SHA"
+            exit 1
+          fi
+          echo "最新 commit SHA: $COMMIT_SHA"
+
+          echo "default_branch=$DEFAULT_BRANCH" >> $GITHUB_OUTPUT
+          echo "commit_sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
+
+      # ============================================
+      # 步骤6.5: 同步上游代码到 fork（保留本地 workflows）
+      # ⚠️ 本步骤有中断保护：如果被取消，会自动恢复本地 workflows
+      # ============================================
+      - name: 🔄 同步上游代码
+        id: code_sync
+        if: github.event.inputs.skip_code_sync != 'true'
+        env:
+          TARGET_SHA: ${{ steps.get_sha.outputs.commit_sha }}
+          DEFAULT_BRANCH: ${{ steps.get_sha.outputs.default_branch }}
+        run: |
+          echo "=========================================="
+          echo "🔄 同步上游代码到 fork（保留本地 workflows）"
+          echo "=========================================="
+          echo "默认分支: $DEFAULT_BRANCH"
+          echo "目标 SHA: $TARGET_SHA"
+
+          CURRENT_BRANCH=$(git branch --show-current)
+          echo "当前分支: $CURRENT_BRANCH"
+
+          # 检查目标 commit 是否已存在于本地
+          if git cat-file -t "$TARGET_SHA" > /dev/null 2>&1; then
+            echo "✅ 目标 commit 已存在于本地仓库"
+          else
+            echo "⚠️ 目标 commit 不存在于本地，需要同步上游代码..."
+
+            # 备份本地 .github/workflows 目录
+            if [ -d ".github/workflows" ]; then
+              echo "📁 备份本地 workflows..."
+              cp -r .github/workflows /tmp/local_workflows_backup
+            fi
+
+            # ⚠️ 中断保护：如果本步骤被取消，自动恢复本地 workflows
+            restore_on_exit() {
+              EXIT_CODE=$?
+              if [ $EXIT_CODE -ne 0 ] && [ -d "/tmp/local_workflows_backup" ]; then
+                echo ""
+                echo "⚠️ 检测到中断（退出码 $EXIT_CODE），紧急恢复本地 workflows..."
+                rm -rf .github/workflows
+                cp -r /tmp/local_workflows_backup .github/workflows
+                git add -A .github/workflows
+                git commit -m "[skip ci] 中断恢复：保留本地 workflows" 2>/dev/null || true
+                git push origin "$CURRENT_BRANCH" 2>/dev/null || true
+                echo "✅ 本地 workflows 已紧急恢复"
+              fi
+              exit $EXIT_CODE
+            }
+            trap restore_on_exit EXIT
+
+            # 获取上游并合并
+            git fetch upstream "$DEFAULT_BRANCH" --force
+            git merge "upstream/$DEFAULT_BRANCH" --no-edit || {
+              echo "⚠️ 自动合并失败，强制重置到上游最新状态..."
+              git reset --hard "upstream/$DEFAULT_BRANCH"
+            }
+
+            # 恢复本地 workflows（覆盖上游的）
+            if [ -d "/tmp/local_workflows_backup" ]; then
+              echo "📁 恢复本地 workflows..."
+              rm -rf .github/workflows
+              cp -r /tmp/local_workflows_backup .github/workflows
+              if git diff --quiet -- .github/workflows; then
+                echo "   workflows 无变化"
+              else
+                git add -A .github/workflows
+                git commit -m "[skip ci] 保留本地 workflows，删除上游 workflows"
+                echo "   ✅ 本地 workflows 已恢复并提交"
+              fi
+            fi
+
+            # 推送到 fork（失败不阻塞 Release 同步，仅记录警告）
+            if git push origin "$CURRENT_BRANCH" --force-with-lease 2>&1 || git push origin "$CURRENT_BRANCH" --force 2>&1; then
+              echo "✅ 代码同步完成（本地 workflows 已保留）"
+            else
+              echo "⚠️ 代码推送失败（可能分支保护或权限不足）"
+              echo "⚠️ 不影响 Release 同步（tag 将使用 github.sha 兜底）"
+              echo "step6_5_push_failed=true" >> $GITHUB_OUTPUT
+            fi
+
+            # 所有操作完成，解除中断保护
+            trap - EXIT
+          fi
+
+          # 输出实际 tag 应指向的 SHA（当前 HEAD，包含本地 workflows）
+          ACTUAL_SHA=$(git rev-parse HEAD)
+          echo "📌 实际 HEAD SHA: $ACTUAL_SHA"
+          echo "tag_target_sha=$ACTUAL_SHA" >> $GITHUB_OUTPUT
+
+      # ============================================
+      # 步骤6.6: 获取当前 HEAD SHA（skip_code_sync 时的兜底）
+      # ============================================
+      - name: 📌 获取当前 HEAD SHA
+        id: get_head_sha
+        if: github.event.inputs.skip_code_sync == 'true'
+        run: |
+          HEAD_SHA=$(git rev-parse HEAD)
+          echo "📌 当前 HEAD SHA: $HEAD_SHA"
+          echo "tag_target_sha=$HEAD_SHA" >> $GITHUB_OUTPUT
+
+      # ============================================
+      # 步骤7: 删除上游 Actions（只保留本地 workflow）
+      # ============================================
+      - name: 🚫 删除上游 Actions
+        id: remove_actions
+        if: github.event.inputs.disable_upstream_actions != 'false'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "=========================================="
+          echo "🚫 删除上游 Actions（只保留本地 workflow）"
+          echo "=========================================="
+
+          # 本地受保护的 workflow 文件名列表
+          PROTECTED_FILES="sync-upstream.yml sync-upstream.yaml"
+
+          # 1. 删除 .github/workflows 下非本地的 yml/yaml 文件
+          if [ -d ".github/workflows" ]; then
+            find .github/workflows -maxdepth 1 \( -name "*.yml" -o -name "*.yaml" -o -name "*.disabled" \) | while read -r file; do
+              filename=$(basename "$file")
+              IS_PROTECTED=false
+              for p in $PROTECTED_FILES; do
+                if [ "$filename" == "$p" ]; then
+                  IS_PROTECTED=true
+                  break
+                fi
+              done
+              if [ "$IS_PROTECTED" == "true" ]; then
+                echo "   🔒 保护: $file"
+              else
+                echo "   🗑️ 删除: $file"
+                rm -f "$file"
+              fi
+            done
+
+            if git status --porcelain | grep -q ".github/workflows"; then
+              PRE_PUSH_SHA=$(git rev-parse HEAD)
+              git add -A .github/workflows/
+              git commit -m "[skip ci] 删除上游 Actions，只保留本地 workflow"
+              if git push origin "$(git branch --show-current)" 2>&1; then
+                echo "✅ 上游 Actions 已删除并提交"
+              else
+                echo "⚠️ 推送失败（可能需要 workflows 权限）"
+                echo "⚠️ 回退本地 commit，fork 代码仍包含上游 workflow 文件"
+                echo "⚠️ 这不影响 Release 同步（tag 将指向不含 workflow 变更的 commit）"
+                git reset --hard "$PRE_PUSH_SHA"
+                echo "step7_push_failed=true" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "✅ 没有需要删除的上游 Actions"
+            fi
+          else
+            echo "⚠️ .github/workflows 目录不存在"
+          fi
+
+          # 输出删除 workflow 后的 HEAD SHA，作为 tag 目标（避免 tag 指向含 workflow 的旧 commit）
+          POST_REMOVE_SHA=$(git rev-parse HEAD)
+          echo "📌 删除 workflow 后的 HEAD SHA: $POST_REMOVE_SHA"
+          echo "tag_target_sha=$POST_REMOVE_SHA" >> $GITHUB_OUTPUT
+
+          # 2. 清理 Actions 历史运行记录（非 sync-upstream 的）
+          echo ""
+          echo "🧹 清理 Actions 历史运行记录..."
+          CURRENT_REPO="${{ github.repository }}"
+
+          # 获取所有 workflow 列表
+          WORKFLOWS=$(gh api "/repos/$CURRENT_REPO/actions/workflows" --paginate 2>/dev/null | jq -c '.workflows[]' 2>/dev/null) || {
+            echo "⚠️ 无法获取 workflow 列表，跳过清理"
+            # 仍然输出 tag_target_sha 和 step7_success（即使跳过清理）
+            POST_REMOVE_SHA=$(git rev-parse HEAD)
+            echo "tag_target_sha=$POST_REMOVE_SHA" >> $GITHUB_OUTPUT
+            echo "step7_success=true" >> $GITHUB_OUTPUT
+            exit 0
+          }
+
+          if [ -z "$WORKFLOWS" ]; then
+            echo "   没有需要清理的 workflow"
+            # 仍然输出 tag_target_sha 和 step7_success（即使无需清理）
+            POST_REMOVE_SHA=$(git rev-parse HEAD)
+            echo "tag_target_sha=$POST_REMOVE_SHA" >> $GITHUB_OUTPUT
+            echo "step7_success=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "$WORKFLOWS" | while read -r wf; do
+            WF_ID=$(echo "$wf" | jq -r '.id')
+            WF_NAME=$(echo "$wf" | jq -r '.name')
+            WF_PATH=$(echo "$wf" | jq -r '.path')
+
+            if echo "$WF_PATH" | grep -q "sync-upstream"; then
+              echo "   🔒 保护: $WF_NAME (ID: $WF_ID)"
+              continue
+            fi
+
+            echo "   🗑️ 清理 workflow: $WF_NAME (ID: $WF_ID, Path: $WF_PATH)"
+
+            RUNS=$(gh api "/repos/$CURRENT_REPO/actions/workflows/$WF_ID/runs?per_page=100" --paginate 2>/dev/null | jq -c '.workflow_runs[]' 2>/dev/null) || true
+
+            if [ -n "$RUNS" ]; then
+              echo "$RUNS" | while read -r run; do
+                RUN_ID=$(echo "$run" | jq -r '.id')
+                gh api -X DELETE "/repos/$CURRENT_REPO/actions/runs/$RUN_ID" 2>/dev/null || true
+              done
+              echo "      ✅ 运行记录已删除"
+            fi
+
+            gh api -X DELETE "/repos/$CURRENT_REPO/actions/workflows/$WF_ID" 2>/dev/null || true
+            echo "      ✅ workflow 已从 Actions 页面移除"
+          done
+          echo "step7_success=true" >> $GITHUB_OUTPUT
+
+      # ============================================
+      # 步骤8: 检查上游 Release（无 Release 时回退到 Tag）
+      # ============================================
+      - name: 🔍 检查上游 Release/Tag
+        id: check_releases
+        if: github.event.inputs.skip_release_sync != 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          UPSTREAM_REPO="${{ steps.detect_upstream.outputs.upstream_repo }}"
+          SYNC_LATEST_ONLY="${{ github.event.inputs.sync_latest_only || env.SYNC_LATEST_ONLY }}"
+
+          echo "=========================================="
+          echo "🔍 检查上游: $UPSTREAM_REPO"
+          echo "只同步最新: $SYNC_LATEST_ONLY"
+          echo "=========================================="
+
+          # 调用 Release API 并捕获 HTTP 状态码
+          HTTP_CODE=$(curl -s -o /tmp/upstream_releases_raw.json -w "%{http_code}" \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$UPSTREAM_REPO/releases?per_page=100")
+
+          echo "📡 Release API HTTP 状态码: $HTTP_CODE"
+          echo "📄 响应前 300 字符:"
+          head -c 300 /tmp/upstream_releases_raw.json
+          echo ""
+
+          ALL_RELEASES="[]"
+          RELEASE_COUNT=0
+          SYNC_SOURCE="none"
+
+          if [ "$HTTP_CODE" == "200" ] && jq empty /tmp/upstream_releases_raw.json 2>/dev/null; then
+            ALL_RELEASES=$(cat /tmp/upstream_releases_raw.json)
+            TOTAL_COUNT=$(echo "$ALL_RELEASES" | jq '. | length')
+            echo "📊 上游总 Release 数量: $TOTAL_COUNT"
+
+            if [ "$TOTAL_COUNT" -gt 0 ]; then
+              SYNC_SOURCE="release"
+            fi
+          else
+            echo "❌ Release API 调用失败或响应非法"
+            TOTAL_COUNT=0
+          fi
+
+          # --- 有 Release 的分支 ---
+          if [ "$SYNC_SOURCE" == "release" ]; then
+            if [ "$SYNC_LATEST_ONLY" == "true" ]; then
+              # 优先取最新的正式版（跳过 Pre-release）
+              RELEASES=$(echo "$ALL_RELEASES" | jq '[.[] | select(.prerelease == false)] | .[0:1]')
+              STABLE_COUNT=$(echo "$RELEASES" | jq '. | length')
+              if [ "$STABLE_COUNT" -eq 0 ]; then
+                echo "⚠️ 上游没有正式版，回退到最新的 Pre-release"
+                RELEASES=$(echo "$ALL_RELEASES" | jq '[.[0]]')
+              else
+                echo "✅ 已选择最新的正式版（跳过 Pre-release）"
+              fi
+              RELEASE_COUNT=1
+              LATEST_TAG=$(echo "$RELEASES" | jq -r '.[0].tag_name')
+              LATEST_PRERELEASE=$(echo "$RELEASES" | jq -r '.[0].prerelease')
+              echo "📌 最新 Release: $LATEST_TAG (Pre-release: $LATEST_PRERELEASE)"
+              echo ""
+              echo "📊 上游 Release 概览："
+              echo "$ALL_RELEASES" | jq -r '.[] | "   \(.tag_name) | Pre-release: \(.prerelease) | \(.created_at)"' | head -5
+            else
+              RELEASES="$ALL_RELEASES"
+              RELEASE_COUNT="$TOTAL_COUNT"
+            fi
+
+            echo "$RELEASES" > /tmp/upstream_releases.json
+            echo "sync_source=release" >> $GITHUB_OUTPUT
+            echo "release_count=$RELEASE_COUNT" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # --- 无 Release，回退到 Tag ---
+          echo ""
+          echo "⚠️ 上游没有 Release，尝试查询 Tag..."
+          TAG_HTTP=$(curl -s -o /tmp/upstream_tags_raw.json -w "%{http_code}" \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$UPSTREAM_REPO/tags?per_page=100")
+
+          echo "📡 Tag API HTTP 状态码: $TAG_HTTP"
+
+          if [ "$TAG_HTTP" != "200" ] || ! jq empty /tmp/upstream_tags_raw.json 2>/dev/null; then
+            echo "❌ Tag API 调用失败或响应非法"
+            echo "release_count=0" >> $GITHUB_OUTPUT
+            echo "sync_source=none" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          ALL_TAGS=$(cat /tmp/upstream_tags_raw.json)
+          TAG_COUNT=$(echo "$ALL_TAGS" | jq '. | length')
+          echo "📊 上游总 Tag 数量: $TAG_COUNT"
+
+          if [ "$TAG_COUNT" -eq 0 ]; then
+            echo "⚠️ 上游既没有 Release 也没有 Tag，跳过同步"
+            echo "release_count=0" >> $GITHUB_OUTPUT
+            echo "sync_source=none" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # 有 Tag，构造类似 Release 的数据结构供步骤9使用
+          # Tag API 返回: [{"name":"v1.0","commit":{"sha":"xxx"}}, ...]
+          if [ "$SYNC_LATEST_ONLY" == "true" ]; then
+            TAGS_TO_SYNC=$(echo "$ALL_TAGS" | jq '[.[0]]')
+            SYNC_COUNT=1
+            LATEST_TAG=$(echo "$TAGS_TO_SYNC" | jq -r '.[0].name')
+            echo "📌 最新 Tag: $LATEST_TAG"
+          else
+            TAGS_TO_SYNC="$ALL_TAGS"
+            SYNC_COUNT="$TAG_COUNT"
+          fi
+
+          # 转换为步骤9兼容的格式（tag_name + 空 body + 空 assets）
+          RELEASES=$(echo "$TAGS_TO_SYNC" | jq '[.[] | {
+            tag_name: .name,
+            name: .name,
+            body: "",
+            prerelease: false,
+            assets: []
+          }]')
+
+          echo "$RELEASES" > /tmp/upstream_releases.json
+          echo "sync_source=tag" >> $GITHUB_OUTPUT
+          echo "release_count=$SYNC_COUNT" >> $GITHUB_OUTPUT
+          echo "✅ 将同步 $SYNC_COUNT 个 Tag（无制品，仅创建 Release 占位）"
+
+      # ============================================
+      # 步骤9: 同步 Releases（使用 git tag + gh release，无需 PAT）
+      # ============================================
+      - name: 📦 同步 Releases 与制品
+        id: sync_releases
+        if: github.event.inputs.skip_release_sync != 'true' && steps.check_releases.outputs.release_count > 0
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SYNC_MODE="${{ github.event.inputs.sync_mode_override || env.SYNC_MODE }}"
+          CURRENT_REPO="${{ github.repository }}"
+          RELEASE_COUNT="${{ steps.check_releases.outputs.release_count }}"
+          # 优先使用步骤7（删除上游 workflow 后）的 HEAD SHA 作为 tag 目标
+          # 这样 tag 指向的 commit 不含上游 workflow，避免 push 时触发 workflows 权限检查
+          # 兜底顺序：步骤7 > 步骤6.5 > 步骤6.6 > 步骤6
+          TARGET_SHA="${{ steps.remove_actions.outputs.tag_target_sha || steps.code_sync.outputs.tag_target_sha || steps.get_head_sha.outputs.tag_target_sha || steps.get_sha.outputs.commit_sha }}"
+          # 如果步骤6.5 push 失败，本地 HEAD 不在远端，tag push 必定失败
+          # 直接使用 github.sha（workflow 触发时的 SHA，必定在远端）
+          STEP6_5_PUSH_FAILED="${{ steps.code_sync.outputs.step6_5_push_failed }}"
+          if [ "$STEP6_5_PUSH_FAILED" == "true" ]; then
+            echo "⚠️ 检测到步骤6.5 push 失败，tag 目标改用 github.sha"
+            TARGET_SHA="${{ github.sha }}"
+          fi
+
+          echo "=========================================="
+          echo "📦 同步 Releases"
+          echo "=========================================="
+          # 兼容 "force" 和 "force - 强制删除后重建" 两种格式
+          case "$SYNC_MODE" in
+            force*) SYNC_MODE="force" ;;
+            incremental*) SYNC_MODE="incremental" ;;
+            *) SYNC_MODE="force" ;;
+          esac
+          echo "同步模式: $SYNC_MODE"
+          echo "Release 数量: $RELEASE_COUNT"
+          echo "Tag 目标 SHA（本地 HEAD）: $TARGET_SHA"
+          echo "=========================================="
+
+          if [ -z "$TARGET_SHA" ]; then
+            echo "❌ 错误: 无法获取目标 commit SHA"
+            exit 1
+          fi
+
+          RELEASES=$(cat /tmp/upstream_releases.json)
+
+          SYNCED_COUNT=0
+          FAILED_COUNT=0
+          SYNCED_TAGS=""
+          while read -r release; do
+            TAG_NAME=$(echo "$release" | jq -r '.tag_name')
+            RELEASE_NAME=$(echo "$release" | jq -r '.name')
+            BODY=$(echo "$release" | jq -r '.body')
+            PRERELEASE=$(echo "$release" | jq -r '.prerelease')
+            ASSET_COUNT=$(echo "$release" | jq '.assets | length')
+            # tag 名可能含 /（如 release/v1.0），替换为 _ 作为文件名（供 BODY_FILE 和 ASSET_FAIL_FILE 使用）
+            SAFE_TAG_NAME=$(echo "$TAG_NAME" | tr '/' '_')
+
+            echo ""
+            echo "=========================================="
+            echo "📌 Release: $TAG_NAME"
+            echo "   制品数量: $ASSET_COUNT"
+            echo "=========================================="
+
+            # --- 创建 Tag（用 git 命令，不走 API，避免 403）---
+            # 兜底 SHA：workflow 触发时的 SHA，必定不含 workflow 变更
+            FALLBACK_SHA="${{ github.sha }}"
+            TAG_PUSHED=false
+
+            if git tag -l "$TAG_NAME" | grep -q .; then
+              echo "   ⚠️ 本地 Tag 已存在"
+              if [ "$SYNC_MODE" == "force" ]; then
+                echo "   🔄 强制模式：删除并重建 Tag..."
+                git tag -d "$TAG_NAME" 2>/dev/null || true
+                git push origin ":refs/tags/$TAG_NAME" 2>/dev/null || true
+              fi
+            fi
+
+            # 创建本地 tag 并推送到远端（走 git 协议，不走 API）
+            if ! git tag -l "$TAG_NAME" | grep -q .; then
+              git tag "$TAG_NAME" "$TARGET_SHA"
+              if git push origin "$TAG_NAME" 2>&1; then
+                echo "   ✅ Tag 推送成功 (SHA: $TARGET_SHA)"
+                TAG_PUSHED=true
+              else
+                echo "   ⚠️ Tag 推送失败 (SHA: $TARGET_SHA)"
+                echo "   ⚠️ 这通常是因为 tag 指向的 commit 包含 workflow 文件变更"
+                # 回退到 github.sha（workflow 触发时的 SHA，不含 workflow 变更）
+                if [ -n "$FALLBACK_SHA" ] && [ "$FALLBACK_SHA" != "$TARGET_SHA" ]; then
+                  echo "   🔄 回退到 workflow 触发时的 SHA: $FALLBACK_SHA"
+                  git tag -d "$TAG_NAME" 2>/dev/null || true
+                  git tag "$TAG_NAME" "$FALLBACK_SHA"
+                  if git push origin "$TAG_NAME" 2>&1; then
+                    echo "   ✅ Tag 推送成功 (回退 SHA: $FALLBACK_SHA)"
+                    TAG_PUSHED=true
+                  fi
+                fi
+                if [ "$TAG_PUSHED" != "true" ]; then
+                  echo "   ❌ Tag 推送失败，无法继续"
+                  FAILED_COUNT=$((FAILED_COUNT + 1))
+                  continue
+                fi
+              fi
+            else
+              TAG_PUSHED=true
+            fi
+
+            # --- 处理 Release（用 gh release，tag 已通过 git 创建）---
+            if gh release view "$TAG_NAME" --repo "$CURRENT_REPO" > /dev/null 2>&1; then
+              echo "   ⚠️ Release 已存在"
+              if [ "$SYNC_MODE" == "force" ]; then
+                echo "   🔄 强制模式：删除并重建 Release..."
+                gh release delete "$TAG_NAME" --yes --repo "$CURRENT_REPO" 2>/dev/null || true
+                sleep 2
+                echo "   ✅ Release 已删除"
+              fi
+            fi
+
+            if ! gh release view "$TAG_NAME" --repo "$CURRENT_REPO" > /dev/null 2>&1; then
+              echo "   📌 创建 Release"
+
+              # 把 body 写入临时文件，避免 shell 转义问题
+              BODY_FILE="/tmp/release_body_${SAFE_TAG_NAME}.md"
+              printf '%s' "$BODY" > "$BODY_FILE"
+
+              PRERELEASE_FLAG=""
+              if [ "$PRERELEASE" == "true" ]; then
+                PRERELEASE_FLAG="--prerelease"
+              fi
+
+              # 不带 --target，使用已存在的 tag（避免 API 创建 tag 触发 403）
+              if gh release create "$TAG_NAME" \
+                --repo "$CURRENT_REPO" \
+                --title "$RELEASE_NAME" \
+                --notes-file "$BODY_FILE" \
+                $PRERELEASE_FLAG; then
+                echo "   ✅ Release 创建成功"
+              else
+                echo "   ❌ Release 创建失败"
+                echo "   ⚠️ 请检查仓库 Settings → Actions → General → Workflow permissions"
+                echo "   ⚠️ 需要选择 'Read and write permissions'"
+                rm -f "$BODY_FILE"
+                FAILED_COUNT=$((FAILED_COUNT + 1))
+                continue
+              fi
+
+              rm -f "$BODY_FILE"
+            fi
+
+            # Release 已存在或创建成功
+            SYNCED_COUNT=$((SYNCED_COUNT + 1))
+            SYNCED_TAGS="$SYNCED_TAGS $TAG_NAME"
+
+            # --- 处理制品 ---
+            if [ "$ASSET_COUNT" == "null" ] || [ "$ASSET_COUNT" -eq 0 ]; then
+              echo "   ⚠️ 没有制品文件"
+              continue
+            fi
+
+            echo "   📦 处理 $ASSET_COUNT 个制品..."
+            ASSET_FAIL_FILE="/tmp/asset_fail_${SAFE_TAG_NAME}.count"
+            echo "0" > "$ASSET_FAIL_FILE"
+            while read -r asset; do
+              ASSET_NAME=$(echo "$asset" | jq -r '.name')
+              ASSET_URL=$(echo "$asset" | jq -r '.browser_download_url')
+              ASSET_SIZE=$(echo "$asset" | jq -r '.size')
+
+              [ -z "$ASSET_NAME" ] && continue
+              [ "$ASSET_NAME" == "null" ] && continue
+
+              if [[ "$ASSET_NAME" == *"Source code"* ]] || [[ "$ASSET_NAME" == *"源码"* ]]; then
+                echo "     ⏭️ 跳过源码包: $ASSET_NAME"
+                continue
+              fi
+
+              echo "     📥 下载: $ASSET_NAME ($ASSET_SIZE bytes)"
+
+              curl -L --fail -s -o "$ASSET_NAME" \
+                --connect-timeout 30 --max-time 1800 \
+                "$ASSET_URL" || {
+                echo "     ❌ 下载失败: $ASSET_NAME"
+                rm -f "$ASSET_NAME"
+                CUR=$(cat "$ASSET_FAIL_FILE" 2>/dev/null || echo 0)
+                echo $((CUR + 1)) > "$ASSET_FAIL_FILE"
+                continue
+              }
+
+              if [ ! -s "$ASSET_NAME" ]; then
+                echo "     ❌ 下载文件为空: $ASSET_NAME"
+                rm -f "$ASSET_NAME"
+                CUR=$(cat "$ASSET_FAIL_FILE" 2>/dev/null || echo 0)
+                echo $((CUR + 1)) > "$ASSET_FAIL_FILE"
+                continue
+              fi
+
+              ACTUAL_SIZE=$(stat -c%s "$ASSET_NAME" 2>/dev/null || echo 0)
+              echo "     📦 实际大小: ${ACTUAL_SIZE} bytes"
+
+              echo "     📤 上传: $ASSET_NAME"
+              if gh release upload "$TAG_NAME" "$ASSET_NAME" --clobber --repo "$CURRENT_REPO"; then
+                echo "     ✅ 上传完成"
+              else
+                echo "     ❌ 上传失败: $ASSET_NAME"
+                CUR=$(cat "$ASSET_FAIL_FILE" 2>/dev/null || echo 0)
+                echo $((CUR + 1)) > "$ASSET_FAIL_FILE"
+              fi
+
+              rm -f "$ASSET_NAME"
+            done < <(echo "$release" | jq -c '.assets[]')
+
+            # 读取制品失败计数并累加到 FAILED_COUNT
+            ASSET_FAILS=$(cat "$ASSET_FAIL_FILE" 2>/dev/null || echo 0)
+            if [ "$ASSET_FAILS" -gt 0 ]; then
+              echo "   ⚠️ 制品失败: $ASSET_FAILS 个"
+              FAILED_COUNT=$((FAILED_COUNT + ASSET_FAILS))
+            fi
+            rm -f "$ASSET_FAIL_FILE"
+          done < <(echo "$RELEASES" | jq -c '.[]')
+
+          echo ""
+          echo "✅ Release 同步完成（成功: $SYNCED_COUNT，失败: $FAILED_COUNT）"
+          if [ "$SYNCED_COUNT" -gt 0 ]; then
+            echo "sync_success=true" >> $GITHUB_OUTPUT
+            echo "synced_tags=$SYNCED_TAGS" >> $GITHUB_OUTPUT
+          fi
+          echo "failed_count=$FAILED_COUNT" >> $GITHUB_OUTPUT
+          # 任何失败都让步骤9失败（job 状态变红），方便定位问题
+          if [ "$FAILED_COUNT" -gt 0 ]; then
+            echo "❌ Release 同步有 $FAILED_COUNT 个失败，步骤标记为失败"
+            exit 1
+          fi
+
+      # ============================================
+      # 步骤10: 清理旧 Releases（仅"只同步最新版本"时执行）
+      # ============================================
+      - name: 🧹 清理旧 Releases（只保留最新）
+        id: cleanup
+        if: |
+          github.event.inputs.sync_latest_only != 'false' &&
+          github.event.inputs.skip_release_sync != 'true' &&
+          steps.check_releases.outputs.release_count > 0 &&
+          steps.sync_releases.outputs.sync_success == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "=========================================="
+          echo "🧹 清理旧 Releases（只保留最新）"
+          echo "=========================================="
+
+          CURRENT_REPO="${{ github.repository }}"
+          # 步骤9同步的 tag 列表（空格分隔），这些 tag 永不删除
+          SYNCED_TAGS="${{ steps.sync_releases.outputs.synced_tags }}"
+
+          # 等待 API 索引刷新（步骤9刚创建的 release 可能还没出现在列表中）
+          sleep 3
+
+          # 按 createdAt 降序排列，确保最新的在前面
+          RELEASE_LIST=$(gh release list --repo "$CURRENT_REPO" --limit 100 --json tagName,createdAt | jq 'sort_by(.createdAt) | reverse')
+
+          TOTAL_COUNT=$(echo "$RELEASE_LIST" | jq '. | length')
+
+          if [ "$TOTAL_COUNT" -le 1 ]; then
+            echo "📌 Release 数量: $TOTAL_COUNT，无需清理"
+            exit 0
+          fi
+
+          echo "📊 当前 Release 数量: $TOTAL_COUNT"
+          echo "🔒 本次同步保护的 tag: $SYNCED_TAGS"
+          echo ""
+
+          DELETED_COUNT=0
+
+          while read -r release; do
+            TAG_NAME=$(echo "$release" | jq -r '.tagName')
+
+            # 只保护本次刚同步的 tag，其余全部删除
+            # （包括旧的 Pre-release、旧正式版等）
+            if echo "$SYNCED_TAGS" | grep -qw "$TAG_NAME"; then
+              echo "   🔒 保护刚同步的: $TAG_NAME"
+              continue
+            fi
+
+            echo "   🗑️ 删除: $TAG_NAME"
+            gh release delete "$TAG_NAME" --yes --repo "$CURRENT_REPO" 2>/dev/null || true
+            DELETED_COUNT=$((DELETED_COUNT + 1))
+          done < <(echo "$RELEASE_LIST" | jq -c '.[]')
+
+          echo ""
+          echo "✅ 清理完成"
+          echo "   删除: $DELETED_COUNT"
+          echo "   保留: $SYNCED_TAGS"
+
+      # ============================================
+      # 步骤11: 验证
+      # ============================================
+      - name: ✅ 验证同步结果
+        id: verify
+        if: github.event.inputs.skip_release_sync != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "=========================================="
+          echo "✅ 验证同步结果"
+          echo "=========================================="
+
+          CURRENT_REPO="${{ github.repository }}"
+
+          gh release list --repo "$CURRENT_REPO" --limit 10
+
+      # ============================================
+      # 步骤12: 汇总报告
+      # ============================================
+      - name: 📊 汇总报告
+        if: always()
+        run: |
+          echo "=========================================="
+          echo "📊 同步汇总报告"
+          echo "=========================================="
+          echo ""
+          echo "| 步骤 | 操作 | 结果 | 说明 |"
+          echo "|------|------|------|------|"
+
+          # 步骤2: 检测上游
+          UPSTREAM="${{ steps.detect_upstream.outputs.upstream_repo }}"
+          if [ -n "$UPSTREAM" ]; then
+            echo "| 🔍 检测上游 | 自动检测 fork 来源 | ✅ 成功 | $UPSTREAM |"
+          else
+            echo "| 🔍 检测上游 | 自动检测 fork 来源 | ❌ 失败 | 未检测到上游仓库 |"
+          fi
+
+          # 步骤6.5: 代码同步
+          SKIP_CODE="${{ github.event.inputs.skip_code_sync || env.SKIP_CODE_SYNC }}"
+          CODE_SHA="${{ steps.code_sync.outputs.tag_target_sha }}"
+          STEP6_5_PUSH_FAILED="${{ steps.code_sync.outputs.step6_5_push_failed }}"
+          if [ "$SKIP_CODE" == "true" ]; then
+            echo "| 🔄 代码同步 | 跳过（用户选择） | ⏭️ 跳过 | 使用当前 HEAD |"
+          elif [ "$STEP6_5_PUSH_FAILED" == "true" ]; then
+            echo "| 🔄 代码同步 | 合并上游代码 | ⚠️ push失败 | 本地已合并但推送失败，tag用github.sha |"
+          elif [ -n "$CODE_SHA" ]; then
+            echo "| 🔄 代码同步 | 合并上游代码 | ✅ 成功 | HEAD=$CODE_SHA |"
+          else
+            echo "| 🔄 代码同步 | 合并上游代码 | ❌ 失败 | 未获取到 SHA |"
+          fi
+
+          # 步骤7: 删除上游 Actions
+          DISABLE_ACTIONS="${{ github.event.inputs.disable_upstream_actions || env.DISABLE_UPSTREAM_ACTIONS }}"
+          STEP7_SUCCESS="${{ steps.remove_actions.outputs.step7_success }}"
+          STEP7_PUSH_FAILED="${{ steps.remove_actions.outputs.step7_push_failed }}"
+          if [ "$DISABLE_ACTIONS" == "false" ]; then
+            echo "| 🚫 删除Actions | 跳过（用户选择） | ⏭️ 跳过 | 保留上游 workflow |"
+          elif [ "$STEP7_PUSH_FAILED" == "true" ]; then
+            echo "| 🚫 删除Actions | 删除上游 workflow | ⚠️ push失败 | 已回退，需 workflows 权限才能删除 |"
+          elif [ "$STEP7_SUCCESS" == "true" ]; then
+            echo "| 🚫 删除Actions | 删除上游 workflow | ✅ 完成 | 删除文件+清理历史 |"
+          else
+            echo "| 🚫 删除Actions | 删除上游 workflow | ❌ 失败 | continue-on-error，不影响后续 |"
+          fi
+
+          # 步骤8-9: Release 同步
+          SKIP_RELEASE="${{ github.event.inputs.skip_release_sync || env.SKIP_RELEASE_SYNC }}"
+          RELEASE_COUNT="${{ steps.check_releases.outputs.release_count }}"
+          SYNC_SOURCE="${{ steps.check_releases.outputs.sync_source }}"
+          SYNC_SUCCESS="${{ steps.sync_releases.outputs.sync_success }}"
+          FAILED_COUNT="${{ steps.sync_releases.outputs.failed_count }}"
+          if [ "$SKIP_RELEASE" == "true" ]; then
+            echo "| 📦 Release同步 | 跳过（用户选择） | ⏭️ 跳过 | — |"
+          elif [ "$RELEASE_COUNT" == "0" ] || [ -z "$RELEASE_COUNT" ]; then
+            echo "| 📦 Release同步 | 检查上游 Release/Tag | ⚠️ 无可同步 | 上游无 Release 且无 Tag |"
+          elif [ "$SYNC_SOURCE" == "tag" ]; then
+            if [ "$SYNC_SUCCESS" == "true" ] && [ "$FAILED_COUNT" == "0" ]; then
+              echo "| 📦 Release同步 | 同步 $RELEASE_COUNT 个 Tag | ✅ 成功 | 无 Release，回退到 Tag |"
+            elif [ "$SYNC_SUCCESS" == "true" ] && [ "$FAILED_COUNT" != "0" ]; then
+              echo "| 📦 Release同步 | 同步 $RELEASE_COUNT 个 Tag | ⚠️ 部分失败 | 失败=$FAILED_COUNT，查看日志 |"
+            else
+              echo "| 📦 Release同步 | 同步 $RELEASE_COUNT 个 Tag | ❌ 失败 | 全部失败，查看日志定位 |"
+            fi
+          elif [ "$SYNC_SUCCESS" == "true" ] && [ "$FAILED_COUNT" == "0" ]; then
+            echo "| 📦 Release同步 | 同步 $RELEASE_COUNT 个 Release | ✅ 成功 | tag+gh release |"
+          elif [ "$SYNC_SUCCESS" == "true" ] && [ "$FAILED_COUNT" != "0" ]; then
+            echo "| 📦 Release同步 | 同步 $RELEASE_COUNT 个 Release | ⚠️ 部分失败 | 成功+失败=$FAILED_COUNT，查看日志 |"
+          else
+            echo "| 📦 Release同步 | 同步 $RELEASE_COUNT 个 Release | ❌ 失败 | 全部失败，查看日志定位 |"
+          fi
+
+          # 步骤10: 清理旧版
+          LATEST_ONLY="${{ github.event.inputs.sync_latest_only || env.SYNC_LATEST_ONLY }}"
+          CLEANUP_OUTCOME="${{ steps.cleanup.outcome }}"
+          if [ "$SKIP_RELEASE" == "true" ] || [ "$LATEST_ONLY" == "false" ]; then
+            echo "| 🧹 清理旧版 | 跳过（条件不满足） | ⏭️ 跳过 | — |"
+          elif [ "$CLEANUP_OUTCOME" == "success" ]; then
+            echo "| 🧹 清理旧版 | 删除旧 Release | ✅ 完成 | 只保留最新 |"
+          elif [ "$CLEANUP_OUTCOME" == "skipped" ]; then
+            echo "| 🧹 清理旧版 | 删除旧 Release | ⏭️ 跳过 | 步骤9未成功或条件不满足 |"
+          else
+            echo "| 🧹 清理旧版 | 删除旧 Release | ⚠️ 状态异常 | outcome=$CLEANUP_OUTCOME |"
+          fi
+
+          # 步骤11: 验证
+          VERIFY_OUTCOME="${{ steps.verify.outcome }}"
+          if [ "$SKIP_RELEASE" == "true" ]; then
+            echo "| ✅ 验证 | 列出本地 Release | ⏭️ 跳过 | — |"
+          elif [ "$VERIFY_OUTCOME" == "success" ]; then
+            echo "| ✅ 验证 | 列出本地 Release | ✅ 完成 | 查看日志详情 |"
+          else
+            echo "| ✅ 验证 | 列出本地 Release | ⚠️ $VERIFY_OUTCOME | — |"
+          fi
+
+          # 整体状态
+          echo ""
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "✅ 整体状态: 成功"
+          else
+            echo "⚠️ 整体状态: 部分失败（查看上方表格定位）"
+          fi
+          echo ""
+          echo "💡 提示: 如遇失败，重跑一次即可自动恢复（幂等设计）"
+
+  # ============================================
+  # 保活任务
+  # ============================================
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    permissions:
+      contents: write
+    
+    needs: sync
+    if: always()
+    
+    steps:
+      - name: 📥 检出仓库
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+          persist-credentials: true
+
+      - name: ⚙️ 配置 Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: 💚 仓库保活
+        run: |
+          echo "=========================================="
+          echo "💚 仓库保活"
+          echo "=========================================="
+
+          CURRENT_TIME=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          echo "当前时间: $CURRENT_TIME"
+
+          # 获取最近一次 commit 的时间戳和 message
+          LAST_COMMIT_TIME=$(git log -1 --format=%ct)
+          LAST_COMMIT_MSG=$(git log -1 --pretty=%B)
+          NOW_TIME=$(date +%s)
+
+          # 计算距今天数
+          DAYS_SINCE=$(( (NOW_TIME - LAST_COMMIT_TIME) / 86400 ))
+          echo "最近提交时间: $(date -u -d @$LAST_COMMIT_TIME '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "距今: ${DAYS_SINCE} 天"
+          echo "最近提交: ${LAST_COMMIT_MSG}"
+
+          # 超过 30 天必须保活；30 天内如果是非 keepalive 提交则跳过
+          if [ "$DAYS_SINCE" -lt 30 ] && [[ "$LAST_COMMIT_MSG" == *"[skip ci] keepalive"* ]]; then
+            echo "✅ 最近 ${DAYS_SINCE} 天内有保活提交，跳过"
+          else
+            echo "⚠️ 距上次提交已 ${DAYS_SINCE} 天，创建保活提交..."
+            # 先拉取远端最新（sync job 可能已推送新提交）
+            git pull --rebase origin "$(git branch --show-current)" 2>/dev/null || true
+            git commit --allow-empty -m "[skip ci] keepalive: 仓库保活 $(date -u '+%Y-%m-%d')"
+            git push origin "$(git branch --show-current)" --force-with-lease
+            echo "✅ 保活提交已推送"
+          fi
+
+          echo "✅ 保活完成"
+
+      - name: 📢 保活结果
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "✅ 保活成功"
+          else
+            echo "❌ 保活失败"
+            exit 1
+          fi
